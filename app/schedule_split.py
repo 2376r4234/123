@@ -10,6 +10,7 @@
 from __future__ import annotations
 
 import re
+from collections.abc import Callable
 from pathlib import Path
 
 import pymupdf
@@ -42,18 +43,87 @@ def normalize_group_name(raw: str) -> str | None:
     return "-".join([match.group(1), match.group(2)])
 
 
-def extract_groups(pdf_path: Path) -> list[str]:
-    """Возвращает список всех групп, встречающихся в PDF."""
-    groups: set[str] = set()
+def safe_file_name(name: str) -> str:
+    """Приводит имя группы к безопасному для файловой системы виду."""
+    return re.sub(r'[<>:"/\\|?*]', "_", name)
+
+
+def split_pdf_images(
+    pdf_path: Path, out_dir: Path, title_for: Callable[[str], str] | None = None
+) -> dict[str, Path]:
+    """Один проход по PDF: режет расписание на готовую картинку для каждой группы.
+
+    Табличная сетка документа разбирается один раз и сразу для всех групп, поэтому
+    нарезка идёт в разы быстрее, чем отрисовка каждой группы по отдельности.
+    Возвращает {группа: путь к PNG}, порядок — как в списке групп школы.
+    """
+    out_dir = Path(out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    for stale in out_dir.glob("*.png"):
+        stale.unlink()
+
+    strips_by_group: dict[str, list[Image.Image]] = {}
     document = pymupdf.open(str(pdf_path))
     try:
         for page in document:
             for table in page.find_tables().tables:
-                for row_index in _header_row_indexes(table):
-                    groups.update(name for name, _ in _group_columns(table, row_index))
+                headers = _header_row_indexes(table)
+                rows = table.rows
+                for position, row_index in enumerate(headers):
+                    columns = dict(_group_columns(table, row_index))
+                    if not columns:
+                        continue
+                    end = headers[position + 1] if position + 1 < len(headers) else len(rows)
+                    block = rows[row_index:end]
+                    if not block:
+                        continue
+                    y0 = min(row.bbox[1] for row in block) - EDGE_INSET
+                    y1 = max(row.bbox[3] for row in block) + EDGE_INSET
+                    # Служебные колонки («Время») одинаковы для всех групп блока —
+                    # рисуем их один раз и переиспользуем.
+                    column_left = min(left for _, (left, _) in columns.items())
+                    first_cell = block[0].cells[0] or (
+                        column_left - EDGE_INSET,
+                        y0,
+                        column_left,
+                        y1,
+                    )
+                    time_strip = _render(
+                        page,
+                        pymupdf.Rect(first_cell[0] - EDGE_INSET, y0, column_left, y1),
+                    )
+                    for group, (x0, x1) in columns.items():
+                        group_rect = pymupdf.Rect(x0, y0, x1, y1)
+                        if not page.get_text("text", clip=group_rect).strip():
+                            continue
+                        strips_by_group.setdefault(group, []).append(
+                            _hstack(
+                                [time_strip, _render(page, group_rect)], GAP_BETWEEN_COLUMNS
+                            )
+                        )
     finally:
         document.close()
-    return sorted(groups, key=_group_sort_key)
+
+    images: dict[str, Path] = {}
+    for group in sorted(strips_by_group, key=_group_sort_key):
+        strips = strips_by_group[group]
+        width = max(image.width for image in strips)
+        strips = [_fit_width(image, width) for image in strips]
+        height = sum(image.height for image in strips) + GAP_BETWEEN_BLOCKS * (
+            len(strips) - 1
+        )
+        result = Image.new("RGB", (width, height), "white")
+        y = 0
+        for image in strips:
+            result.paste(image, (0, y))
+            y += image.height + GAP_BETWEEN_BLOCKS
+        result = _trim_white(result)
+        if title_for is not None:
+            result = _add_title(result, title_for(group))
+        path = out_dir / f"{safe_file_name(group)}.png"
+        result.save(path, format="PNG", compress_level=6)
+        images[group] = path
+    return images
 
 
 def render_group_image(pdf_path: Path, group: str, title: str = "") -> Image.Image | None:

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import shutil
 from datetime import date
 from html import escape
 from io import BytesIO
@@ -45,15 +46,45 @@ def _read_text(path) -> str:
     return Path(path).read_text(encoding="utf-8-sig", errors="replace")
 
 
-def _school_groups(channel: Channel, path) -> list[str]:
-    """Список групп: для PDF — из таблиц документа, для таблицы — из CSV.
+def _sheet_groups(path) -> list[str]:
+    """Все группы Google Таблицы из всех секций.
 
-    Для таблицы берём все группы из всех секций, чтобы в списке были доступны и те,
-    у кого в текущей секции (например, во временных изменениях) занятий нет.
+    Берём группы из всех секций, чтобы в списке были доступны и те, у кого
+    в текущей секции (например, во временных изменениях) занятий нет.
     """
-    if channel.source == "google_sheet":
-        return list(schedule_source.parse_sheet(_read_text(path))[0])
-    return schedule_split.extract_groups(path)
+    return list(schedule_source.parse_sheet(_read_text(path))[0])
+
+
+def group_images_dir(channel: Channel, file_id: str) -> Path:
+    """Папка с готовыми картинками групп для конкретного файла расписания."""
+    return settings.cache_dir(channel.id) / f"{file_id[:16]}_groups"
+
+
+def group_title(channel: Channel, group: str, file_name: str) -> str:
+    """Подпись к картинке группы: школа, группа и дата расписания."""
+    label = format_date_title(file_name)
+    suffix = f"\n{label}" if label != channel.name else ""
+    return f"{channel.name} · группа {group}{suffix}"
+
+
+def ensure_group_images(
+    channel: Channel, file_id: str, pdf_path: Path, file_name: str
+) -> dict[str, Path]:
+    """Готовит картинки всех групп файла один раз и кладёт их в кэш.
+
+    Нарезка PDF — самая тяжёлая операция, поэтому она выполняется однократно при
+    появлении нового файла, а не заново при каждом открытии группы.
+    """
+    out_dir = group_images_dir(channel, file_id)
+    ready = {path.stem: path for path in sorted(out_dir.glob("*.png"))}
+    if ready:
+        return ready
+    for stale in settings.cache_dir(channel.id).glob("*_groups"):
+        if stale != out_dir:
+            shutil.rmtree(stale, ignore_errors=True)
+    return schedule_split.split_pdf_images(
+        pdf_path, out_dir, title_for=lambda group: group_title(channel, group, file_name)
+    )
 
 
 async def check_all(bot: Bot) -> None:
@@ -101,7 +132,15 @@ async def notify_file(bot: Bot, channel: Channel, source_file: schedule_source.S
     path = await asyncio.to_thread(
         schedule_source.download, source_file, settings.cache_dir(channel.id)
     )
-    groups = set(await asyncio.to_thread(_school_groups, channel, path))
+    if channel.source == "google_sheet":
+        groups = set(await asyncio.to_thread(_sheet_groups, path))
+        images_dir = None
+    else:
+        images = await asyncio.to_thread(
+            ensure_group_images, channel, source_file.id, path, source_file.name
+        )
+        groups = set(images)
+        images_dir = group_images_dir(channel, source_file.id)
     if not groups:
         logger.warning("В файле «%s» не найдено ни одной группы", source_file.name)
         return
@@ -120,6 +159,7 @@ async def notify_file(bot: Bot, channel: Channel, source_file: schedule_source.S
                 group,
                 source_file.name,
                 header="Новое расписание",
+                images_dir=images_dir,
             )
         except Exception:
             logger.exception(
@@ -136,6 +176,19 @@ async def get_school_schedule(channel: Channel) -> dict | None:
         and cache["file_path"]
         and Path(cache["file_path"]).exists()
     ):
+        if channel.source != "google_sheet" and cache["file_id"]:
+            # Картинки групп могли не сохраниться (например, после перезапуска
+            # хостинга) — готовим их заранее, чтобы отправка была мгновенной.
+            try:
+                await asyncio.to_thread(
+                    ensure_group_images,
+                    channel,
+                    cache["file_id"],
+                    Path(cache["file_path"]),
+                    cache["file_name"],
+                )
+            except Exception:
+                logger.exception("Не удалось подготовить картинки школы «%s»", channel.name)
         return cache
 
     try:
@@ -164,7 +217,13 @@ async def refresh_cache(channel: Channel, files: list[schedule_source.SourceFile
     path = await asyncio.to_thread(
         schedule_source.download, relevant, settings.cache_dir(channel.id)
     )
-    groups = await asyncio.to_thread(_school_groups, channel, path)
+    if channel.source == "google_sheet":
+        groups = await asyncio.to_thread(_sheet_groups, path)
+    else:
+        images = await asyncio.to_thread(
+            ensure_group_images, channel, relevant.id, path, relevant.name
+        )
+        groups = list(images)
     await asyncio.to_thread(
         storage.save_cache, channel.id, relevant.id, relevant.name, path, groups
     )
@@ -197,10 +256,10 @@ async def send_group_photo(
     group: str,
     file_name: str,
     header: str,
+    images_dir: Path | None = None,
 ) -> bool:
     label = format_date_title(file_name)
-    suffix = f"\n{label}" if label != channel.name else ""
-    title = f"{channel.name} · группа {group}{suffix}"
+    title = group_title(channel, group, file_name)
     if channel.source == "google_sheet":
         image = await asyncio.to_thread(
             _render_sheet_group,
@@ -211,12 +270,16 @@ async def send_group_photo(
             channel.bells,
             channel.saturday_bells,
         )
+        photo_bytes = _to_png_bytes(image) if image is not None else None
     else:
-        image = await asyncio.to_thread(
-            schedule_split.render_group_image, file_path, group, title
-        )
+        photo_bytes = await asyncio.to_thread(_cached_group_bytes, images_dir, group)
+        if photo_bytes is None:
+            image = await asyncio.to_thread(
+                schedule_split.render_group_image, file_path, group, title
+            )
+            photo_bytes = _to_png_bytes(image) if image is not None else None
 
-    if image is None:
+    if photo_bytes is None:
         await bot.send_message(
             chat_id, escape(f"В расписании нет занятий для группы {group}.")
         )
@@ -227,7 +290,7 @@ async def send_group_photo(
         f"{header}\n{channel.name} · группа {group}{caption_tail}"
     )
     photo = BufferedInputFile(
-        _to_png_bytes(image), filename=f"{channel.id.replace(':', '_')}_{group}.png"
+        photo_bytes, filename=f"{channel.id.replace(':', '_')}_{group}.png"
     )
 
     previous_message_id = await asyncio.to_thread(
@@ -253,6 +316,20 @@ async def _delete_previous(bot: Bot, chat_id: int, message_id: int | None) -> No
         await bot.delete_message(chat_id, message_id)
     except TelegramAPIError:
         logger.info("Прошлое расписание (message_id=%s) удалить не удалось", message_id)
+
+
+def _cached_group_bytes(images_dir: Path | None, group: str) -> bytes | None:
+    """Готовый PNG группы из кэша: без повторной отрисовки и перекодирования."""
+    if not images_dir:
+        return None
+    path = Path(images_dir) / f"{schedule_split.safe_file_name(group)}.png"
+    if not path.exists():
+        return None
+    with Image.open(path) as image:
+        if max(image.size) <= MAX_IMAGE_SIDE and sum(image.size) <= MAX_IMAGE_SUM:
+            return path.read_bytes()
+        image.load()
+        return _to_png_bytes(image)
 
 
 def _to_png_bytes(image: Image.Image) -> bytes:

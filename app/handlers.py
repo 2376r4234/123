@@ -396,6 +396,10 @@ async def _send_schedule(bot: Bot, chat_id: int, channel, group: str, header: st
 
     file_path = (schedule or {}).get("file_path")
     if schedule and file_path and Path(file_path).exists():
+        images_dir = None
+        file_id = schedule.get("file_id")
+        if channel.source != "google_sheet" and file_id:
+            images_dir = scheduler.group_images_dir(channel, file_id)
         await scheduler.send_group_photo(
             bot,
             chat_id,
@@ -404,6 +408,7 @@ async def _send_schedule(bot: Bot, chat_id: int, channel, group: str, header: st
             group,
             schedule["file_name"],
             header=header,
+            images_dir=images_dir,
         )
         return
     await bot.send_message(
