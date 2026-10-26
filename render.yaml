@@ -1,0 +1,18 @@
+services:
+  - type: web
+    name: rasspisanie-bot
+    runtime: python
+    plan: free
+    branch: main
+    buildCommand: pip install -r requirements.txt
+    startCommand: python main.py
+    healthCheckPath: /health
+    envVars:
+      - key: PYTHON_VERSION
+        value: "3.12.7"
+      - key: BOT_TOKEN
+        sync: false
+      - key: ADMIN_IDS
+        value: "1965624081"
+      - key: CHECK_INTERVAL_MINUTES
+        value: "30"
