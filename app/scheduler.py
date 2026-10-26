@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import shutil
+import threading
 from datetime import date
 from html import escape
 from io import BytesIO
@@ -67,24 +68,42 @@ def group_title(channel: Channel, group: str, file_name: str) -> str:
     return f"{channel.name} · группа {group}{suffix}"
 
 
+_locks_guard = threading.Lock()
+_dir_locks: dict[str, threading.Lock] = {}
+
+
+def _dir_lock(path: Path) -> threading.Lock:
+    """Замок на папку с картинками: две одновременные нарезки одного файла не нужны."""
+    key = str(path)
+    with _locks_guard:
+        lock = _dir_locks.get(key)
+        if lock is None:
+            lock = threading.Lock()
+            _dir_locks[key] = lock
+        return lock
+
+
 def ensure_group_images(
     channel: Channel, file_id: str, pdf_path: Path, file_name: str
 ) -> dict[str, Path]:
     """Готовит картинки всех групп файла один раз и кладёт их в кэш.
 
     Нарезка PDF — самая тяжёлая операция, поэтому она выполняется однократно при
-    появлении нового файла, а не заново при каждом открытии группы.
+    появлении нового файла, а не заново при каждом открытии группы. Замок нужен,
+    чтобы запрос из бота и планер не запустили нарезку одновременно: на слабом
+    хостинге две параллельные нарезки подряд надолго занимают процессор.
     """
     out_dir = group_images_dir(channel, file_id)
-    ready = {path.stem: path for path in sorted(out_dir.glob("*.png"))}
-    if ready:
-        return ready
-    for stale in settings.cache_dir(channel.id).glob("*_groups"):
-        if stale != out_dir:
-            shutil.rmtree(stale, ignore_errors=True)
-    return schedule_split.split_pdf_images(
-        pdf_path, out_dir, title_for=lambda group: group_title(channel, group, file_name)
-    )
+    with _dir_lock(out_dir):
+        ready = {path.stem: path for path in sorted(out_dir.glob("*.png"))}
+        if ready:
+            return ready
+        for stale in settings.cache_dir(channel.id).glob("*_groups"):
+            if stale != out_dir:
+                shutil.rmtree(stale, ignore_errors=True)
+        return schedule_split.split_pdf_images(
+            pdf_path, out_dir, title_for=lambda group: group_title(channel, group, file_name)
+        )
 
 
 async def check_all(bot: Bot) -> None:
@@ -105,6 +124,17 @@ async def check_channel(bot: Bot, channel: Channel) -> None:
         logger.info(
             "Школа «%s»: первый запуск, запомнено файлов — %d", channel.name, len(files)
         )
+        # После перезапуска хостинга база на диске теряется, поэтому файл, который
+        # уже лежит в источнике, попадает в «первый запуск» и раньше молча
+        # запоминался. Если это расписание на сегодня или на будущее — рассылаем
+        # его, иначе подписчики не узнают об обновлении.
+        relevant = schedule_source.pick_relevant(files)
+        if (
+            relevant is not None
+            and relevant.published is not None
+            and relevant.published >= date.today()
+        ):
+            await notify_file(bot, channel, relevant)
         return
 
     new_files = [item for item in files if item.id not in known]
@@ -168,14 +198,22 @@ async def notify_file(bot: Bot, channel: Channel, source_file: schedule_source.S
         await asyncio.sleep(0.05)
 
 
+def _cache_is_usable(cache: dict | None) -> bool:
+    """Кэш пригоден, если файл на месте и это не расписание прошедшего дня.
+
+    Расписание с датой в прошлом считается устаревшим: пока планер не успел
+    обновиться (он проверяет источник раз в полчаса), пользователь иначе получил бы
+    вчерашний день. Такие случаи заставляют бота лишний раз сходить в источник.
+    """
+    if not (cache and cache["groups"] and cache["file_path"] and Path(cache["file_path"]).exists()):
+        return False
+    published = schedule_source.parse_date(cache["file_name"] or "")
+    return published is None or published >= date.today()
+
+
 async def get_school_schedule(channel: Channel) -> dict | None:
     cache = await asyncio.to_thread(storage.get_cache, channel.id)
-    if (
-        cache
-        and cache["groups"]
-        and cache["file_path"]
-        and Path(cache["file_path"]).exists()
-    ):
+    if _cache_is_usable(cache):
         if channel.source != "google_sheet" and cache["file_id"]:
             # Картинки групп могли не сохраниться (например, после перезапуска
             # хостинга) — готовим их заранее, чтобы отправка была мгновенной.

@@ -67,40 +67,8 @@ def split_pdf_images(
     try:
         for page in document:
             for table in page.find_tables().tables:
-                headers = _header_row_indexes(table)
-                rows = table.rows
-                for position, row_index in enumerate(headers):
-                    columns = dict(_group_columns(table, row_index))
-                    if not columns:
-                        continue
-                    end = headers[position + 1] if position + 1 < len(headers) else len(rows)
-                    block = rows[row_index:end]
-                    if not block:
-                        continue
-                    y0 = min(row.bbox[1] for row in block) - EDGE_INSET
-                    y1 = max(row.bbox[3] for row in block) + EDGE_INSET
-                    # Служебные колонки («Время») одинаковы для всех групп блока —
-                    # рисуем их один раз и переиспользуем.
-                    column_left = min(left for _, (left, _) in columns.items())
-                    first_cell = block[0].cells[0] or (
-                        column_left - EDGE_INSET,
-                        y0,
-                        column_left,
-                        y1,
-                    )
-                    time_strip = _render(
-                        page,
-                        pymupdf.Rect(first_cell[0] - EDGE_INSET, y0, column_left, y1),
-                    )
-                    for group, (x0, x1) in columns.items():
-                        group_rect = pymupdf.Rect(x0, y0, x1, y1)
-                        if not page.get_text("text", clip=group_rect).strip():
-                            continue
-                        strips_by_group.setdefault(group, []).append(
-                            _hstack(
-                                [time_strip, _render(page, group_rect)], GAP_BETWEEN_COLUMNS
-                            )
-                        )
+                for group, strips in _collect_strips(page, table).items():
+                    strips_by_group.setdefault(group, []).extend(strips)
     finally:
         document.close()
 
@@ -133,7 +101,8 @@ def render_group_image(pdf_path: Path, group: str, title: str = "") -> Image.Ima
     try:
         for page in document:
             for table in page.find_tables().tables:
-                strips.extend(_page_group_strips(page, table, group))
+                for found in _collect_strips(page, table, {group}).values():
+                    strips.extend(found)
     finally:
         document.close()
 
@@ -155,52 +124,65 @@ def render_group_image(pdf_path: Path, group: str, title: str = "") -> Image.Ima
     return result
 
 
-def _page_group_strips(page: "pymupdf.Page", table, group: str) -> list[Image.Image]:
-    """Возвращает полосы «время + группа» для одной страницы."""
-    strips: list[Image.Image] = []
-    headers = _header_row_indexes(table)
-    rows = table.rows
+def _collect_strips(
+    page: "pymupdf.Page", table, wanted: set[str] | None = None
+) -> dict[str, list[Image.Image]]:
+    """Полосы «время + группа» из одной таблицы.
+
+    Сетка и текст таблицы разбираются по одному разу на таблицу: раньше это
+    повторялось для каждой строки-заголовка и заметно замедляло нарезку.
+    wanted=None — берутся все группы, иначе только перечисленные.
+    """
+    grid = table.extract()
+    row_objects = table.rows
+    headers = _header_row_indexes(grid)
+    collected: dict[str, list[Image.Image]] = {}
+
     for position, row_index in enumerate(headers):
-        columns = dict(_group_columns(table, row_index))
-        if group not in columns:
+        columns = _group_columns(grid, row_objects, row_index)
+        if wanted is not None:
+            columns = [(name, bounds) for name, bounds in columns if name in wanted]
+        if not columns:
             continue
-        x0, x1 = columns[group]
-        end = headers[position + 1] if position + 1 < len(headers) else len(rows)
-        block = rows[row_index:end]
+        end = headers[position + 1] if position + 1 < len(headers) else len(row_objects)
+        block = row_objects[row_index:end]
         if not block:
             continue
         y0 = min(row.bbox[1] for row in block) - EDGE_INSET
         y1 = max(row.bbox[3] for row in block) + EDGE_INSET
-        # Слева от расписания группы берём служебные колонки: № пары, № урока и «Время».
-        column_left = min(left for _, (left, _) in columns.items())
+        # Слева от расписания группы берём служебные колонки: № пары, № урока и «Время»;
+        # они одинаковы для всех групп блока, поэтому рисуются один раз.
+        column_left = min(left for _, (left, _) in columns)
         first_cell = block[0].cells[0] or (column_left - EDGE_INSET, y0, column_left, y1)
-        time_rect = pymupdf.Rect(first_cell[0] - EDGE_INSET, y0, column_left, y1)
-        group_rect = pymupdf.Rect(x0, y0, x1, y1)
-        if not page.get_text("text", clip=group_rect).strip():
-            continue
-        strips.append(
-            _hstack([_render(page, time_rect), _render(page, group_rect)], GAP_BETWEEN_COLUMNS)
+        time_strip = _render(
+            page, pymupdf.Rect(first_cell[0] - EDGE_INSET, y0, column_left, y1)
         )
-    return strips
+        for group, (x0, x1) in columns:
+            group_rect = pymupdf.Rect(x0, y0, x1, y1)
+            if not page.get_text("text", clip=group_rect).strip():
+                continue
+            collected.setdefault(group, []).append(
+                _hstack([time_strip, _render(page, group_rect)], GAP_BETWEEN_COLUMNS)
+            )
+    return collected
 
 
-def _header_row_indexes(table) -> list[int]:
+def _header_row_indexes(grid) -> list[int]:
     """Номера строк таблицы, в которых перечислены группы (строка «Группа:»)."""
-    indexes: list[int] = []
-    for index, row in enumerate(table.extract()):
-        if any((cell or "").strip().startswith("Группа") for cell in row):
-            indexes.append(index)
-    return indexes
+    return [
+        index
+        for index, row in enumerate(grid)
+        if any((cell or "").strip().startswith("Группа") for cell in row)
+    ]
 
 
-def _group_columns(table, row_index: int) -> list[tuple[str, tuple[float, float]]]:
+def _group_columns(grid, row_objects, row_index: int) -> list[tuple[str, tuple[float, float]]]:
     """[(название группы, (x0, x1)), ...] из строки-заголовка блока."""
     columns: list[tuple[str, tuple[float, float]]] = []
-    texts = table.extract()[row_index]
-    cells = table.rows[row_index].cells
-    for index, text in enumerate(texts):
+    cells = row_objects[row_index].cells
+    for index, text in enumerate(grid[row_index]):
         name = normalize_group_name(text)
-        if not name or index >= len(cells):
+        if not name or index >= len(cells) or not cells[index]:
             continue
         cell = cells[index]
         columns.append((name, (cell[0], cell[2])))
