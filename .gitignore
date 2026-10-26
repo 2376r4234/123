@@ -1,0 +1,26 @@
+# Виртуальные окружения
+.venv/
+venv/
+env/
+
+# Кэш Python
+__pycache__/
+*.py[cod]
+
+# Секреты — задаются переменными окружения на хостинге
+.env
+
+# Данные бота (кэш расписаний, SQLite) — на Render используйте диск
+data/
+
+# Временные каталоги
+_probe/
+_test_render/
+
+# IDE
+.idea/
+.vscode/
+
+# ОС
+Thumbs.db
+.DS_Store
