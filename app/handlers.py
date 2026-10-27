@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from datetime import date, timedelta
 from html import escape
 from pathlib import Path
 
@@ -386,10 +387,12 @@ async def paginate_groups(callback: CallbackQuery, state: FSMContext) -> None:
     )
 
 
-async def _send_schedule(bot: Bot, chat_id: int, channel, group: str, header: str) -> None:
+async def _send_schedule(
+    bot: Bot, chat_id: int, channel, group: str, header: str, target_date: date | None = None
+) -> None:
     """Отправляет картинку расписания группы (текущего или основного)."""
     try:
-        schedule = await scheduler.get_school_schedule(channel)
+        schedule = await scheduler.get_school_schedule(channel, target_date)
     except Exception:
         logger.exception("Не удалось получить расписание школы «%s»", channel.name)
         schedule = None
@@ -409,10 +412,16 @@ async def _send_schedule(bot: Bot, chat_id: int, channel, group: str, header: st
             schedule["file_name"],
             header=header,
             images_dir=images_dir,
+            target_date=target_date,
         )
         return
+
+    text = "Расписание ещё не опубликовано — пришлю его, как только оно появится."
+    if target_date:
+        text = f"Расписание на {target_date.strftime('%d.%m.%Y')} ещё не опубликовано."
+
     await bot.send_message(
-        chat_id, "Расписание ещё не опубликовано — пришлю его, как только оно появится."
+        chat_id, text, reply_markup=scheduler.schedule_keyboard(channel.id, group)
     )
 
 
@@ -446,11 +455,61 @@ async def choose_group(callback: CallbackQuery, state: FSMContext, bot: Bot) -> 
     await callback.answer("Подписка оформлена")
     await asyncio.to_thread(storage.set_subscription, callback.from_user.id, channel_id, group)
     await state.clear()
+    
+    # Запоминаем это сообщение как последнее, чтобы send_group_photo его удалил
+    await asyncio.to_thread(storage.save_last_message, chat_id, channel_id, callback.message.message_id)
+    
     await callback.message.edit_text(
-        f"Готово! Вы подписаны на расписание группы {escape(group)} ({escape(channel.name)}).\n"
-        "Отправляю текущее расписание…"
+        f"⏳ Ищу расписание на сегодня для группы {escape(group)}...",
+        reply_markup=scheduler.schedule_keyboard(channel_id, group),
     )
     await _send_schedule(bot, chat_id, channel, group, header="Текущее расписание")
+
+
+async def choose_day(callback: CallbackQuery, bot: Bot) -> None:
+    """Обработка кнопок «На сегодня» и «На завтра»."""
+    parts = callback.data.split(":")
+    if len(parts) != 4:
+        return
+    _, channel_id, group, day_type = parts
+    channel = settings.channel(channel_id)
+    if not channel:
+        await callback.answer("Школа не найдена", show_alert=True)
+        return
+
+    target_date = date.today()
+    label = "сегодня"
+    if day_type == "tomorrow":
+        target_date += timedelta(days=1)
+        label = "завтра"
+
+    await callback.answer()
+    
+    # Запоминаем текущее сообщение, чтобы оно было удалено при отправке нового фото
+    await asyncio.to_thread(
+        storage.save_last_message, callback.message.chat.id, channel_id, callback.message.message_id
+    )
+    
+    try:
+        await callback.message.edit_caption(
+            caption=f"⏳ Ищу расписание на {label} для группы {escape(group)}...",
+            reply_markup=scheduler.schedule_keyboard(channel_id, group),
+        )
+    except Exception:
+        # Если это было текстовое сообщение без фото
+        await callback.message.edit_text(
+            text=f"⏳ Ищу расписание на {label} для группы {escape(group)}...",
+            reply_markup=scheduler.schedule_keyboard(channel_id, group),
+        )
+
+    await _send_schedule(
+        bot,
+        callback.message.chat.id,
+        channel,
+        group,
+        header=f"Расписание на {label}",
+        target_date=target_date,
+    )
 
 
 async def go_back(callback: CallbackQuery, state: FSMContext) -> None:
@@ -506,6 +565,7 @@ router.callback_query(F.data.startswith("mainshift:"))(choose_main_shift)
 router.callback_query(F.data.startswith("main:"))(choose_main)
 router.callback_query(F.data.startswith("gpage:"))(paginate_groups)
 router.callback_query(F.data.startswith("grp:"))(choose_group)
+router.callback_query(F.data.startswith("day:"))(choose_day)
 router.callback_query(F.data.startswith("back:"))(go_back)
 router.callback_query(F.data == "noop")(noop)
 

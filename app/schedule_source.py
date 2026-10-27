@@ -11,6 +11,7 @@ import hashlib
 import html as html_lib
 import io
 import re
+import time
 from dataclasses import dataclass, field
 from datetime import date
 from pathlib import Path
@@ -81,6 +82,14 @@ def pick_relevant(files: list[SourceFile], today: date | None = None) -> SourceF
     return max(files, key=lambda item: item.published or date.min)
 
 
+def find_for_date(files: list[SourceFile], target: date) -> SourceFile | None:
+    """Ищет файл, опубликованный ровно на указанную дату."""
+    for item in files:
+        if item.published == target:
+            return item
+    return None
+
+
 def list_files(channel: Channel) -> list[SourceFile]:
     """Возвращает все файлы расписания, опубликованные для школы (или её смены)."""
     if channel.source == "gdrive_folder":
@@ -98,7 +107,7 @@ def _list_gdrive_folder(channel: Channel) -> list[SourceFile]:
         raise ValueError(
             "В ссылке школы «" + channel.name + "» не найден ID папки Google Drive"
         )
-    url = "https://drive.google.com/embeddedfolderview?id=" + folder_id + "#list"
+    url = "https://drive.google.com/embeddedfolderview?id=" + folder_id + "&t=" + str(int(time.time())) + "#list"
     page = _get(url)
 
     files: list[SourceFile] = []
@@ -108,7 +117,14 @@ def _list_gdrive_folder(channel: Channel) -> list[SourceFile]:
         if file_id in seen:
             continue
         seen.add(file_id)
-        name = _clean_text(match.group("name"))
+        raw_name = match.group("name")
+        # Пытаемся достать чистый заголовок из спец-блока, если он есть (для нового вида Google Drive)
+        title_match = re.search(r'class="flip-entry-title">(.*?)</div>', raw_name)
+        if title_match:
+            name = _clean_text(title_match.group(1))
+        else:
+            name = _clean_text(raw_name)
+        
         files.append(
             SourceFile(
                 id=file_id,

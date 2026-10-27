@@ -13,7 +13,7 @@ from pathlib import Path
 
 from aiogram import Bot
 from aiogram.exceptions import TelegramAPIError
-from aiogram.types import BufferedInputFile
+from aiogram.types import BufferedInputFile, InlineKeyboardButton, InlineKeyboardMarkup
 from PIL import Image
 
 from . import schedule_source, schedule_split, storage
@@ -211,12 +211,11 @@ def _cache_is_usable(cache: dict | None) -> bool:
     return published is None or published >= date.today()
 
 
-async def get_school_schedule(channel: Channel) -> dict | None:
+async def get_school_schedule(channel: Channel, target_date: date | None = None) -> dict | None:
     cache = await asyncio.to_thread(storage.get_cache, channel.id)
-    if _cache_is_usable(cache):
+    # Если запрашивается конкретная дата, кэш можно использовать только если он совпадает по дате
+    if not target_date and _cache_is_usable(cache):
         if channel.source != "google_sheet" and cache["file_id"]:
-            # Картинки групп могли не сохраниться (например, после перезапуска
-            # хостинга) — готовим их заранее, чтобы отправка была мгновенной.
             try:
                 await asyncio.to_thread(
                     ensure_group_images,
@@ -235,22 +234,32 @@ async def get_school_schedule(channel: Channel) -> dict | None:
         logger.exception("Не удалось получить список файлов школы «%s»", channel.name)
         return cache
 
-    return await refresh_cache(channel, files)
+    return await refresh_cache(channel, files, target_date)
 
 
-async def refresh_cache(channel: Channel, files: list[schedule_source.SourceFile]) -> dict | None:
+async def refresh_cache(
+    channel: Channel, files: list[schedule_source.SourceFile], target_date: date | None = None
+) -> dict | None:
     if not files:
         return None
 
-    relevant = schedule_source.pick_relevant(files)
-    cache = await asyncio.to_thread(storage.get_cache, channel.id)
-    if (
-        cache
-        and cache["file_id"] == relevant.id
-        and cache["file_path"]
-        and Path(cache["file_path"]).exists()
-    ):
-        return cache
+    if target_date and channel.source != "google_sheet":
+        relevant = schedule_source.find_for_date(files, target_date)
+        if not relevant:
+            return None
+    else:
+        relevant = schedule_source.pick_relevant(files)
+
+    # Если мы обновляем основной кэш (нет target_date), проверяем, не тот же ли это файл
+    if not target_date:
+        cache = await asyncio.to_thread(storage.get_cache, channel.id)
+        if (
+            cache
+            and cache["file_id"] == relevant.id
+            and cache["file_path"]
+            and Path(cache["file_path"]).exists()
+        ):
+            return cache
 
     path = await asyncio.to_thread(
         schedule_source.download, relevant, settings.cache_dir(channel.id)
@@ -262,12 +271,19 @@ async def refresh_cache(channel: Channel, files: list[schedule_source.SourceFile
             ensure_group_images, channel, relevant.id, path, relevant.name
         )
         groups = list(images)
-    await asyncio.to_thread(
-        storage.save_cache, channel.id, relevant.id, relevant.name, path, groups
-    )
-    logger.info(
-        "Кэш школы «%s» обновлён: %s (%d групп)", channel.name, relevant.name, len(groups)
-    )
+
+    # Сохраняем в БД только «основное» (наиболее актуальное) расписание
+    if not target_date:
+        await asyncio.to_thread(
+            storage.save_cache, channel.id, relevant.id, relevant.name, path, groups
+        )
+        logger.info(
+            "Кэш школы «%s» обновлён: %s (%d групп)",
+            channel.name,
+            relevant.name,
+            len(groups),
+        )
+
     return {
         "file_id": relevant.id,
         "file_name": relevant.name,
@@ -277,12 +293,31 @@ async def refresh_cache(channel: Channel, files: list[schedule_source.SourceFile
 
 
 def _render_sheet_group(
-    path, group: str, title: str, section: str | None, bells: dict | None, sat_bells: dict | None
+    path,
+    group: str,
+    title: str,
+    section: str | None,
+    bells: dict | None,
+    sat_bells: dict | None,
+    target_date: date | None = None,
 ) -> Image.Image | None:
     _, data = schedule_source.parse_sheet(_read_text(path), section)
     blocks = data.get(group)
     if not blocks:
         return None
+
+    if target_date:
+        # Фильтруем блоки по дате
+        filtered = []
+        for block in blocks:
+            b_date = schedule_source.parse_date(block.title)
+            if b_date == target_date:
+                filtered.append(block)
+        blocks = filtered
+
+    if not blocks:
+        return None
+
     return schedule_split.render_sheet_image(blocks, title, bells, sat_bells)
 
 
@@ -295,6 +330,7 @@ async def send_group_photo(
     file_name: str,
     header: str,
     images_dir: Path | None = None,
+    target_date: date | None = None,
 ) -> bool:
     label = format_date_title(file_name)
     title = group_title(channel, group, file_name)
@@ -307,9 +343,11 @@ async def send_group_photo(
             channel.section,
             channel.bells,
             channel.saturday_bells,
+            target_date,
         )
         photo_bytes = _to_png_bytes(image) if image is not None else None
     else:
+        # Для PDF (МГСТ) target_date уже учтён при выборе файла в get_school_schedule
         photo_bytes = await asyncio.to_thread(_cached_group_bytes, images_dir, group)
         if photo_bytes is None:
             image = await asyncio.to_thread(
@@ -318,15 +356,15 @@ async def send_group_photo(
             photo_bytes = _to_png_bytes(image) if image is not None else None
 
     if photo_bytes is None:
-        await bot.send_message(
-            chat_id, escape(f"В расписании нет занятий для группы {group}.")
-        )
+        text = f"В расписании нет занятий для группы {group}"
+        if target_date:
+            text += f" на {target_date.strftime('%d.%m.%Y')}"
+        text += "."
+        await bot.send_message(chat_id, escape(text), reply_markup=schedule_keyboard(channel.id, group))
         return False
 
     caption_tail = f" · {label}" if label != channel.name else ""
-    caption = escape(
-        f"{header}\n{channel.name} · группа {group}{caption_tail}"
-    )
+    caption = escape(f"{header}\n{channel.name} · группа {group}{caption_tail}")
     photo = BufferedInputFile(
         photo_bytes, filename=f"{channel.id.replace(':', '_')}_{group}.png"
     )
@@ -335,16 +373,43 @@ async def send_group_photo(
         storage.get_last_message, chat_id, channel.id
     )
     try:
-        message = await bot.send_photo(chat_id, photo, caption=caption[:CAPTION_LIMIT])
+        message = await bot.send_photo(
+            chat_id,
+            photo,
+            caption=caption[:CAPTION_LIMIT],
+            reply_markup=schedule_keyboard(channel.id, group),
+        )
     except TelegramAPIError:
         logger.warning("send_photo не сработал, отправляю файлом", exc_info=True)
-        message = await bot.send_document(chat_id, photo, caption=caption[:CAPTION_LIMIT])
+        message = await bot.send_document(
+            chat_id,
+            photo,
+            caption=caption[:CAPTION_LIMIT],
+            reply_markup=schedule_keyboard(channel.id, group),
+        )
 
     await asyncio.to_thread(
         storage.save_last_message, chat_id, channel.id, message.message_id
     )
     await _delete_previous(bot, chat_id, previous_message_id)
     return True
+
+
+def schedule_keyboard(channel_id: str, group_name: str) -> InlineKeyboardMarkup:
+    """Клавиатура с кнопками «На сегодня», «На завтра» и «Сменить класс»."""
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text="📅 На сегодня", callback_data=f"day:{channel_id}:{group_name}:today"
+                ),
+                InlineKeyboardButton(
+                    text="📅 На завтра", callback_data=f"day:{channel_id}:{group_name}:tomorrow"
+                ),
+            ],
+            [InlineKeyboardButton(text="⚙ Сменить класс", callback_data="back:schools")],
+        ]
+    )
 
 
 async def _delete_previous(bot: Bot, chat_id: int, message_id: int | None) -> None:
